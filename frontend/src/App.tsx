@@ -1,42 +1,33 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import './App.css'
+import { useLocalState } from './useLocalState'
+import { readChatStream } from './chatStream'
+import { isProjects, isReminders, isWorkspace, statuses, formatTimeline } from './workspace'
+import type { ProjectItem, ProjectTask, TaskStatus, Workspace, ReminderItem } from './workspace'
 
 type ProviderInfo = {
   provider: string
   label: string
   models: string[]
   defaultModel: string
+  status?: string
 }
 
 type ChatMessage = {
   id: number
   role: 'user' | 'assistant'
   content: string
+  changes?: string[]
+  error?: boolean
+  pending?: boolean
+  durationMs?: number
+  retryText?: string
 }
 
 type SectionKey = 'Overview' | 'AI Chat' | 'Workbench' | 'Agents' | 'Storage'
 
-type TaskStatus = 'Backlog' | 'Ready' | 'In progress' | 'In review' | 'Done'
-
 type AgentKey = 'documentation' | 'reminders'
-
-type ProjectTask = {
-  id: number
-  title: string
-  assignee: string
-  timeline: string
-  notes: string
-  createdBy: string
-  updatedBy: string
-  status: TaskStatus
-}
-
-type ProjectItem = {
-  id: number
-  name: string
-  tasks: ProjectTask[]
-}
 
 type StorageEntry = {
   id: number
@@ -49,6 +40,21 @@ type StorageEntry = {
 }
 
 function App() {
+  const chatEndRef = useRef<HTMLDivElement>(null)
+  const messageSequence = useRef(0)
+  const followConversationRef = useRef(true)
+  const [storageWarning, setStorageWarning] = useState('')
+  const requestRef = useRef<AbortController | null>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  const workspaceRef = useRef<Workspace>({ projects: [], selectedProjectId: null, reminders: [] })
+  const [isAdmin, setIsAdmin] = useState(false)
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [chatProgress, setChatProgress] = useState('')
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
+  const [lastChange, setLastChange] = useState<{ before: Workspace; after: string; messageId: number } | null>(null)
+  const [taskSearch, setTaskSearch] = useState('')
+  const [taskOwner, setTaskOwner] = useState('')
+
   const [authenticated, setAuthenticated] = useState(false)
   const [username, setUsername] = useState('admin')
   const [loginForm, setLoginForm] = useState({ username: 'admin', password: '' })
@@ -56,35 +62,39 @@ function App() {
   const [showAdminLogin, setShowAdminLogin] = useState(false)
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [selectedProvider, setSelectedProvider] = useState('gemini')
-  const [selectedModel, setSelectedModel] = useState('gemini-2.5-flash')
+  const [selectedModel, setSelectedModel] = useState('')
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [statusMessage, setStatusMessage] = useState('')
   const [historyItems, setHistoryItems] = useState<ChatMessage[]>([])
   const [activeSection, setActiveSection] = useState<SectionKey>('Overview')
-  const [enabledAgents, setEnabledAgents] = useState<Record<AgentKey, boolean>>({
+  const [enabledAgents, setEnabledAgents] = useLocalState<Record<AgentKey, boolean>>('jetson.workspace.agents.v1', {
     documentation: false,
     reminders: false,
-  })
+  }, (value): value is Record<AgentKey, boolean> => !!value && typeof value === 'object' && 'documentation' in value && 'reminders' in value && typeof value.documentation === 'boolean' && typeof value.reminders === 'boolean')
+  const [reminders, setReminders] = useLocalState<ReminderItem[]>('jetson.workspace.reminders.v1', [], isReminders)
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const notifiedRemindersRef = useRef(new Set<number>())
+  const [notificationPermission, setNotificationPermission] = useState(() => typeof Notification === 'undefined' ? 'unsupported' : Notification.permission)
+  const [reminderDraft, setReminderDraft] = useState({ title: '', dueAt: '' })
   const [documentationMessages, setDocumentationMessages] = useState<ChatMessage[]>([
     {
       id: 1,
       role: 'assistant',
-      content: 'Documentation agent ready. Upload a file or image, choose a skill, and I will draft a document or deck for the workspace storage.',
+      content: 'Documentation agent ready. Upload a text source (.txt, .md, .csv, .json) and I will draft a document or an HTML presentation outline.',
     },
   ])
   const [documentationInput, setDocumentationInput] = useState('')
   const [documentationSkills, setDocumentationSkills] = useState<Record<string, boolean>>({
     summarize: true,
-    'image-analysis': false,
-    'deck-builder': false,
+    'release-notes': false,
+    'deck-outline': false,
     'research-note': true,
   })
   const [documentationFormat, setDocumentationFormat] = useState<'Document' | 'Presentation'>('Document')
   const [attachedFiles, setAttachedFiles] = useState<File[]>([])
-  const [reminderItems, setReminderItems] = useState<Array<{ id: number; title: string; note: string }>>([])
-  const [projects, setProjects] = useState<ProjectItem[]>([
+  const [projects, setProjects] = useLocalState<ProjectItem[]>('jetson.workspace.projects.v1', [
     {
       id: 1,
       name: 'Product Launch',
@@ -117,7 +127,7 @@ function App() {
         },
       ],
     },
-  ])
+  ], isProjects)
   const [selectedProjectId, setSelectedProjectId] = useState<number>(1)
   const [newProjectName, setNewProjectName] = useState('')
   const [taskDraft, setTaskDraft] = useState({
@@ -151,23 +161,57 @@ function App() {
       downloadUrl: 'data:text/plain;charset=utf-8,Launch%20brief%20for%20the%20product%20team.',
     },
   ])
-  const isAdmin = username.toLowerCase() === 'admin'
-
   useEffect(() => {
-    void checkAuth()
+    if (followConversationRef.current) chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
+  }, [chatMessages, busy])
+
+  const activeProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0]
+  const workspace: Workspace = { projects, selectedProjectId: activeProject?.id ?? null, reminders }
+  useEffect(() => { workspaceRef.current = { projects, selectedProjectId: projects.find((p) => p.id === selectedProjectId)?.id ?? projects[0]?.id ?? null, reminders } }, [projects, selectedProjectId, reminders])
+  useEffect(() => {
+    if (!busy) return
+    const started = Date.now()
+    const timer = window.setInterval(() => setElapsedSeconds(Math.floor((Date.now() - started) / 1000)), 1000)
+    return () => window.clearInterval(timer)
+  }, [busy])
+  useEffect(() => () => { requestRef.current?.abort() }, [])
+  useEffect(() => {
+    const onStorageError = () => setStorageWarning('Browser storage is unavailable or full. Your edits work for this session but may not survive a refresh. Export your projects before leaving.')
+    window.addEventListener('workspace-storage-error', onStorageError)
+    return () => window.removeEventListener('workspace-storage-error', onStorageError)
   }, [])
 
-  useEffect(() => {
-    if (!authenticated) return
-    void loadModels()
-  }, [authenticated])
 
+  const dueReminders = enabledAgents.reminders ? reminders.filter((item) => item.status === 'pending' && Date.parse(item.dueAt) <= nowMs) : []
+  const pendingReminders = reminders.filter((item) => item.status === 'pending')
   useEffect(() => {
-    const provider = providers.find((item) => item.provider === selectedProvider)
-    if (!provider || provider.models.length === 0) return
-    const fallback = provider.defaultModel || provider.models[0]
-    setSelectedModel(fallback)
-  }, [selectedProvider, providers])
+    const timer = window.setInterval(() => setNowMs(Date.now()), 15000)
+    return () => window.clearInterval(timer)
+  }, [])
+  useEffect(() => {
+    if (!authenticated || !enabledAgents.reminders) return
+    for (const item of reminders) {
+      if (item.status !== 'pending' || Date.parse(item.dueAt) > nowMs || notifiedRemindersRef.current.has(item.id)) continue
+      notifiedRemindersRef.current.add(item.id)
+      if (notificationPermission === 'granted') {
+        try { new Notification(item.title, { body: item.notes || 'Your Jetson reminder is due.', tag: `jetson-reminder-${item.id}` }) } catch { /* Due reminders remain visible in the app. */ }
+      }
+    }
+  }, [authenticated, enabledAgents.reminders, reminders, nowMs, notificationPermission])
+
+  const completeReminder = (id: number) => setReminders((current) => current.map((item) => item.id === id ? { ...item, status: 'done' } : item))
+  const createReminder = () => {
+    const date = new Date(reminderDraft.dueAt)
+    if (!reminderDraft.title.trim() || !Number.isFinite(date.getTime()) || date.getTime() <= Date.now()) {
+      setStatusMessage('Enter a reminder title and a future date and time.'); return
+    }
+    if (reminders.length >= 200) { setStatusMessage('The reminder list is full. Export or remove completed reminders first.'); return }
+    const id = Math.max(0, ...projects.flatMap((p) => [p.id, ...p.tasks.map((t) => t.id)]), ...reminders.map((r) => r.id)) + 1
+    setReminders((current) => [...current, { id, title: reminderDraft.title.trim(), dueAt: date.toISOString(), notes: '', status: 'pending' }])
+    setEnabledAgents((current) => ({ ...current, reminders: true }))
+    setReminderDraft({ title: '', dueAt: '' })
+    setStatusMessage('Reminder sent to the Reminder Agent. Monitoring while this app is open.')
+  }
 
   const checkAuth = async () => {
     try {
@@ -176,6 +220,7 @@ function App() {
       if (data.authenticated) {
         setAuthenticated(true)
         setUsername(data.username)
+        setIsAdmin(data.isAdmin === true)
         setLoginForm((current) => ({ ...current, username: data.username }))
       } else {
         setAuthenticated(false)
@@ -185,21 +230,39 @@ function App() {
     }
   }
 
-  const loadModels = async () => {
+  const loadModels = async (refresh = false) => {
+    setModelsLoading(true)
     try {
-      const response = await fetch('/api/models', { credentials: 'include' })
+      const response = await fetch(`/api/models${refresh ? '?refresh=true' : ''}`, { credentials: 'include', signal: AbortSignal.timeout(12000) })
       const data = await response.json()
-      const list = data.providers ?? []
+      if (!response.ok) throw new Error('Model discovery failed.')
+      const list: ProviderInfo[] = data.providers ?? []
       setProviders(list)
       if (list.length > 0) {
-        setSelectedProvider(list[0].provider)
-        setSelectedModel(list[0].defaultModel || list[0].models[0])
+        const available = list.find((item: ProviderInfo) => item.models.length > 0) ?? list[0]
+        setSelectedProvider(available.provider)
+        setSelectedModel(available.defaultModel || available.models[0] || '')
       }
     } catch (error) {
       console.error('Model load failed', error)
-      setStatusMessage('Model discovery is temporarily unavailable.')
+      setStatusMessage('Could not load models. Check your connection and select Refresh models.')
+    } finally {
+      setModelsLoading(false)
     }
   }
+
+  useEffect(() => {
+    // Fetch remote session state on mount.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void checkAuth()
+  }, [])
+
+  useEffect(() => {
+    if (!authenticated) return
+    // Synchronize available models with the remote providers.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadModels()
+  }, [authenticated])
 
   const getErrorMessage = (payload: unknown, fallback: string) => {
     if (typeof payload === 'string') return payload
@@ -242,9 +305,10 @@ function App() {
 
       setAuthenticated(true)
       setUsername(data.username || name)
+      setIsAdmin(data.isAdmin === true)
       setChatMessages([])
       setStatusMessage(`Welcome, ${data.username || name}.`)
-      await loadModels()
+
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Guest sign-in failed.')
     }
@@ -254,6 +318,7 @@ function App() {
     event.preventDefault()
     setStatusMessage('Signing in...')
 
+    try {
     const response = await fetch('/api/auth/login', {
       method: 'POST',
       credentials: 'include',
@@ -272,17 +337,28 @@ function App() {
 
     setAuthenticated(true)
     setUsername(data.username)
+    setIsAdmin(data.isAdmin === true)
     setChatMessages([])
     setStatusMessage('Logged in successfully.')
-    await loadModels()
+    } catch {
+      setStatusMessage('Could not connect. Check that the backend is running and try again.')
+    }
   }
 
   const handleLogout = async () => {
+    requestRef.current?.abort()
+    try {
     await fetch('/api/auth/logout', {
       method: 'POST',
       credentials: 'include',
     })
+    } catch {
+      setStatusMessage('Could not sign out. Check your connection and try again.')
+      return
+    }
     setAuthenticated(false)
+    setIsAdmin(false)
+    setLastChange(null)
     setUsername('admin')
     setLoginForm({ username: 'admin', password: '' })
     setGuestName('')
@@ -302,7 +378,9 @@ function App() {
   const storageBreadcrumbs = (() => {
     const items: StorageEntry[] = []
     let cursor: StorageEntry | undefined = currentStorageFolder
-    while (cursor) {
+    const visited = new Set<number>()
+    while (cursor && !visited.has(cursor.id)) {
+      visited.add(cursor.id)
       items.unshift(cursor)
       cursor = cursor.parentId === null ? undefined : storageFolderLookup[cursor.parentId]
     }
@@ -324,28 +402,20 @@ function App() {
     setStorageItems((current) => [...current, ...items])
   }
 
-  useEffect(() => {
-    if (!enabledAgents.reminders) {
-      setReminderItems([])
-      return
-    }
-
-    const nextItems = projects.flatMap((project) =>
-      project.tasks.map((task) => ({
-        id: task.id,
-        title: `${project.name}: ${task.title}`,
-        note: `${task.assignee} • ${task.timeline} • ${task.status}`,
-      })),
-    )
-
-    setReminderItems(nextItems.slice(0, 6))
-  }, [enabledAgents.reminders, projects])
-
-  const activeProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0]
+  const reminderItems = enabledAgents.reminders ? projects.flatMap((project) =>
+    project.tasks.filter((task) => task.status !== 'Done').map((task) => ({
+      id: task.id, title: `${project.name}: ${task.title}`,
+      note: `${task.assignee} • ${task.timeline} • ${task.status}`,
+    })),
+  ).slice(0, 6) : []
 
   const handleCreateProject = () => {
     const trimmed = newProjectName.trim()
     if (!trimmed) return
+    if (projects.some((project) => project.name.toLowerCase() === trimmed.toLowerCase())) {
+      setStatusMessage('A project with this name already exists.')
+      return
+    }
 
     const newProject = {
       id: Date.now(),
@@ -376,12 +446,14 @@ function App() {
   }
 
   const handleAddTask = () => {
-    if (!taskDraft.title.trim() || !taskDraft.assignee.trim()) return
+    if (!activeProject) { setStatusMessage('Create a project before adding a task.'); return }
+    if (!taskDraft.title.trim()) { setStatusMessage('Give your task a name.'); return }
+    if (activeProject.tasks.some((task) => task.title.toLowerCase() === taskDraft.title.trim().toLowerCase())) { setStatusMessage('This task already exists in the project.'); return }
 
     const newTask: ProjectTask = {
       id: Date.now(),
       title: taskDraft.title.trim(),
-      assignee: taskDraft.assignee.trim(),
+      assignee: taskDraft.assignee.trim() || 'Unassigned',
       timeline: taskDraft.timeline.trim() || 'TBD',
       notes: taskDraft.notes.trim() || 'No notes added.',
       createdBy: username || 'admin',
@@ -391,7 +463,7 @@ function App() {
 
     setProjects((current) =>
       current.map((project) =>
-        project.id === selectedProjectId
+        project.id === activeProject.id
           ? { ...project, tasks: [...project.tasks, newTask] }
           : project,
       ),
@@ -418,7 +490,8 @@ function App() {
     if (agent === 'reminders') setActiveSection('Overview')
   }
 
-  const handleDocumentationSubmit = () => {
+  const handleDocumentationSubmit = async () => {
+    if (requestRef.current || busy || !selectedModel) return
     const prompt = documentationInput.trim()
     if (!prompt && attachedFiles.length === 0) return
 
@@ -427,13 +500,30 @@ function App() {
       .map(([name]) => name)
       .join(', ') || 'general drafting'
 
-    const sourceNames = attachedFiles.length > 0 ? attachedFiles.map((file) => file.name).join(', ') : 'no attached source'
-    const generatedTitle = documentationFormat === 'Presentation' ? 'Project deck draft' : 'Documentation draft'
 
-    const responseText =
-      documentationFormat === 'Presentation'
-        ? `# ${generatedTitle}\n\n## Objective\n${prompt || 'Create a presentation based on the attached files.'}\n\n## Source files\n${sourceNames}\n\n## Slide 1: Overview\n- Goal\n- Key stakeholders\n- Workspace context\n\n## Slide 2: Findings\n- Extracted insights from the uploaded material\n- Cross-checks with the project timeline\n\n## Slide 3: Next steps\n- Action items\n- Owners\n- Delivery timeline\n\n## Skills used\n${skillSummary}\n\nThis deck was auto-generated for the ${activeProject?.name ?? 'current project'} workspace.`
-        : `# ${generatedTitle}\n\n## Summary\n${prompt || 'Generated document based on uploaded material.'}\n\n## Attached sources\n${sourceNames}\n\n## Details\n- Skill set: ${skillSummary}\n- Project: ${activeProject?.name ?? 'Current workspace'}\n- Format: ${documentationFormat}\n\n## Notes\nThis draft was created automatically by the documentation agent and saved to the shared storage folder.`
+    let responseText: string
+
+    setBusy(true)
+    setStatusMessage('Drafting with your selected model…')
+    try {
+      const sources = await Promise.all(attachedFiles.map(async (file) => {
+        if (!/\.(txt|md|csv|json)$/i.test(file.name)) return `${file.name}: content extraction unavailable; do not infer its contents.`
+        return `${file.name}:\n${(await file.text()).slice(0, 12000)}`
+      }))
+      const result = await fetch('/api/chat', {
+        method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: selectedProvider, model: selectedModel,
+          message: `Draft a ${documentationFormat.toLowerCase()} in Markdown. Skills: ${skillSummary}. Request: ${prompt || 'Summarize the sources'}. Sources:\n${sources.join('\n').slice(0, 12000)}. Be explicit about missing source information.` }),
+      })
+      const data = await result.json()
+      if (!result.ok) throw new Error(getErrorMessage(data, 'Draft generation failed.'))
+      responseText = data.answer
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Draft generation failed.')
+      return
+    } finally {
+      setBusy(false)
+    }
 
     const userMessage: ChatMessage = {
       id: Date.now(),
@@ -450,7 +540,7 @@ function App() {
 
     const fileName = `${(activeProject?.name ?? 'workspace').toLowerCase().replace(/\s+/g, '-')}-${documentationFormat.toLowerCase()}-${Date.now()}.${documentationFormat === 'Presentation' ? 'html' : 'md'}`
     const blob = new Blob(
-      [documentationFormat === 'Presentation' ? `<html><body>${responseText.replace(/\n/g, '<br/>')}</body></html>` : responseText],
+      [documentationFormat === 'Presentation' ? `<html><body>${responseText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br/>')}</body></html>` : responseText],
       { type: documentationFormat === 'Presentation' ? 'text/html;charset=utf-8' : 'text/markdown;charset=utf-8' },
     )
     const url = URL.createObjectURL(blob)
@@ -471,192 +561,104 @@ function App() {
     setStatusMessage(`${documentationFormat} draft saved to storage.`)
   }
 
-  const handleAiRequest = () => {
-    const text = input.trim()
-    if (!text) return
-
-    const assistantText = (() => {
-      const lower = text.toLowerCase()
-
-      if (/create project|new project|create repo|new repo/.test(lower)) {
-        const nameMatch = text.match(/(?:create|new)\s+(?:project|repo)\s+(.+)/i)
-        const candidate = nameMatch?.[1]?.trim() || 'New project'
-        const projectName = candidate.replace(/^['"]|['"]$/g, '')
-        const nextId = Date.now()
-        setProjects((current) => [...current, { id: nextId, name: projectName, tasks: [] }])
-        setSelectedProjectId(nextId)
-        return `I created the project “${projectName}” and selected it for you.`
-      }
-
-      if (/edit task|update task|enhance task|improve task|refine task|modify task/.test(lower)) {
-        const keyMatch = text.match(/(?:edit|update|enhance|improve|refine|modify)\s+(?:task|ticket)\s+(.+?)(?:\s+(?:to|with|and)|$)/i)
-        const taskName = keyMatch?.[1]?.trim() || 'latest task'
-        const targetTask = (activeProject?.tasks ?? []).find((task) =>
-          task.title.toLowerCase().includes(taskName.toLowerCase()),
-        )
-
-        if (targetTask) {
-          const nextTitle = text.match(/title\s+(.+?)(?:\s+(?:for|as|and)|$)/i)?.[1]?.trim() || targetTask.title
-          const nextAssignee = text.match(/assign(?:ed)?\s+(?:to\s+)?(.+?)(?:\s+(?:for|on|with)|$)/i)?.[1]?.trim() || targetTask.assignee
-          const nextTimeline = text.match(/timeline\s+(.+?)(?:\s+(?:for|and)|$)/i)?.[1]?.trim() || targetTask.timeline
-          const nextNotes = text.match(/notes?\s+(.+)/i)?.[1]?.trim() || targetTask.notes
-
-          setProjects((current) =>
-            current.map((project) => ({
-              ...project,
-              tasks: project.tasks.map((task) =>
-                task.id === targetTask.id
-                  ? {
-                      ...task,
-                      title: nextTitle,
-                      assignee: nextAssignee,
-                      timeline: nextTimeline,
-                      notes: `${task.notes} • ${nextNotes}`.trim(),
-                      updatedBy: username || 'admin',
-                    }
-                  : task,
-              ),
-            })),
-          )
-          return `I updated the task “${targetTask.title}” with the new details you requested.`
-        }
-      }
-
-      if (/add task|create task|new task/.test(lower)) {
-        const titleMatch = text.match(/(?:add|create|new)\s+(?:task|ticket)\s+(.+)/i)
-        const title = titleMatch?.[1]?.trim() || 'New task'
-        const newTask: ProjectTask = {
-          id: Date.now(),
-          title,
-          assignee: 'Unassigned',
-          timeline: 'TBD',
-          notes: 'Added from AI chat.',
-          createdBy: username || 'admin',
-          updatedBy: username || 'admin',
-          status: 'Backlog',
-        }
-        setProjects((current) =>
-          current.map((project) =>
-            project.id === selectedProjectId
-              ? { ...project, tasks: [...project.tasks, newTask] }
-              : project,
-          ),
-        )
-        return `I added the task “${title}” to the active project in Backlog.`
-      }
-
-      if (/move|mark/.test(lower)) {
-        const taskMatch = text.match(/(?:move|mark)\s+(.+?)\s+(?:to|as)\s+(.+)/i)
-        const taskName = taskMatch?.[1]?.trim() || 'latest task'
-        const statusName = taskMatch?.[2]?.trim() || 'Backlog'
-        const statusMap: Record<string, ProjectTask['status']> = {
-          backlog: 'Backlog',
-          ready: 'Ready',
-          'in progress': 'In progress',
-          'in review': 'In review',
-          done: 'Done',
-        }
-        const mapped = statusMap[statusName.toLowerCase()] || 'Backlog'
-        setProjects((current) =>
-          current.map((project) => ({
-            ...project,
-            tasks: project.tasks.map((task) =>
-              task.title.toLowerCase().includes(taskName.toLowerCase())
-                ? { ...task, status: mapped, updatedBy: username || 'admin' }
-                : task,
-            ),
-          })),
-        )
-        return `I moved “${taskName}” to ${mapped}.`
-      }
-
-      return 'I can create projects, add tasks, assign owners, and update project status from your request.'
-    })()
-
-    const userMessage: ChatMessage = {
-      id: Date.now(),
-      role: 'user',
-      content: text,
-    }
-    const assistantMessage: ChatMessage = {
-      id: Date.now() + 1,
-      role: 'assistant',
-      content: assistantText,
-    }
-    setChatMessages((current) => [...current, userMessage, assistantMessage])
-    if (isAdmin) {
-      setHistoryItems((current) => [...current, userMessage, assistantMessage])
-    }
-    setInput('')
-    setStatusMessage('Project update processed.')
-  }
-
-  const handleAiCommand = () => {
-    const text = input.trim()
-    if (!text || busy) return
-
-    if (/create project|new project|create repo|new repo|add task|create task|new task|edit task|update task|enhance task|improve task|refine task|modify task|move|mark/.test(text)) {
-      handleAiRequest()
-      return
-    }
-
-    void handleSend()
-  }
-
-  const handleChatSubmit = () => {
-    handleAiCommand()
-  }
-
-  const handleSend = async () => {
-    const trimmed = input.trim()
-    if (!trimmed || busy) return
-
-    const userMessage: ChatMessage = {
-      id: Date.now(),
-      role: 'user',
-      content: trimmed,
-    }
-    setChatMessages((current) => [...current, userMessage])
-    if (isAdmin) {
-      setHistoryItems((current) => [...current, userMessage])
-    }
+  const handleSend = async (retryText?: string) => {
+    const text = (retryText ?? input).trim()
+    if (!text || busy || requestRef.current || !selectedModel) return
+    const controller = new AbortController()
+    requestRef.current = controller
+    const timeout = window.setTimeout(() => controller.abort('timeout'), 65000)
+    const before = structuredClone(workspace)
+    const fingerprint = JSON.stringify(before)
+    messageSequence.current += 2
+    const messageId = messageSequence.current
+    const userMessage: ChatMessage = { id: messageId - 1, role: 'user', content: text }
+    followConversationRef.current = true
+    setChatMessages((current) => [...current, userMessage, { id: messageId, role: 'assistant', content: '', pending: true }])
     setInput('')
     setBusy(true)
-    setStatusMessage('Generating response...')
-
+    setElapsedSeconds(0)
+    setChatProgress('Connecting to your assistant…')
+    setStatusMessage('')
+    let streamedText = ''
+    let completed = false
+    const updateMessage = (patch: Partial<ChatMessage>) => setChatMessages((current) => current.map((message) => message.id === messageId ? { ...message, ...patch } : message))
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        credentials: 'include',
+      const response = await fetch('/api/chat/stream', {
+        method: 'POST', credentials: 'include', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: selectedProvider,
-          model: selectedModel,
-          message: trimmed,
-        }),
+        body: JSON.stringify({ provider: selectedProvider, model: selectedModel, message: text,
+          history: chatMessages.filter((message) => !message.error && !message.pending && message.content.trim()).slice(-10)
+            .map(({ role, content, changes }) => ({ role, content: [content, ...(changes ?? [])].join('\n').slice(0, 16000) })),
+          workspace: before, timezoneOffsetMinutes: new Date().getTimezoneOffset() }),
       })
-
-      const data = await response.json().catch(() => ({ answer: 'Unable to reach the model.' }))
       if (!response.ok) {
-        throw new Error(data.detail || 'Chat request failed.')
+        if (response.status === 404) throw new Error('The running backend is missing the chat endpoint. Restart the Jetson backend, refresh this page, and sign in again.')
+        if (response.status === 401) { setAuthenticated(false); setIsAdmin(false) }
+        throw new Error(getErrorMessage(await response.json().catch(() => ({})), 'Could not reach the assistant.'))
       }
-
-      const assistantMessage: ChatMessage = {
-        id: Date.now() + 1,
-        role: 'assistant',
-        content: data.answer || 'No answer received from the active model.',
+      let finalEvent: import('./chatStream').StreamEvent | undefined
+      await readChatStream(response, (event) => {
+        if (controller.signal.aborted) throw new Error('Request stopped.')
+        if (event.type === 'status') setChatProgress(event.message || 'Working…')
+        if (event.type === 'delta') {
+          streamedText += event.text || ''
+          updateMessage({ content: streamedText })
+          setChatProgress('Preparing your reply and checking any project changes…')
+        }
+        if (event.type === 'result') finalEvent = event
+      })
+      // Apply only a complete validated result, never partial stream data.
+      if (!finalEvent || controller.signal.aborted) throw new Error('Request stopped. No changes were applied.')
+      const result = finalEvent as import('./chatStream').StreamEvent
+      const changes = result.changes ?? []
+      if (changes.length > 0) {
+        if (!isWorkspace(result.workspace)) throw new Error('The assistant returned invalid workspace data. No changes were applied.')
+        if (JSON.stringify(workspaceRef.current) !== fingerprint) throw new Error('Your project changed while the AI was working. No AI edits were applied; please retry with the latest board.')
+        setProjects(result.workspace.projects)
+        setReminders(result.workspace.reminders)
+        if (result.workspace.reminders.some((item) => !before.reminders.some((old) => old.id === item.id))) setEnabledAgents((current) => ({ ...current, reminders: true }))
+        setSelectedProjectId(result.workspace.selectedProjectId ?? 0)
+        setTaskOwner('')
+        setTaskSearch('')
+        setLastChange({ before, after: JSON.stringify(result.workspace), messageId })
+        workspaceRef.current = result.workspace
       }
-      setChatMessages((current) => [...current, assistantMessage])
-      if (isAdmin) {
-        setHistoryItems((current) => [...current, assistantMessage])
-      }
-      setStatusMessage(`Response generated with ${selectedProvider} / ${selectedModel}.`)
+      const answer = result.answer || 'Done.'
+      updateMessage({ content: answer, changes, pending: false, durationMs: result.durationMs })
+      if (isAdmin) setHistoryItems((current) => [...current, userMessage, { id: messageId, role: 'assistant', content: [answer, ...changes].join('\n') }])
+      setStatusMessage(`${result.model || selectedModel} · ${((result.durationMs ?? 0) / 1000).toFixed(1)}s${changes.length ? ` · ${changes.length} changes applied` : ''}`)
+      completed = true
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Chat generation failed.'
-      setStatusMessage(`The selected model is unavailable right now. ${message}`)
+      const message = controller.signal.aborted
+        ? controller.signal.reason === 'timeout' ? 'The model took too long. Try a faster model or a shorter request.' : 'Stopped. No project changes were applied.'
+        : error instanceof Error ? error.message : 'The request failed. Please try again.'
+      updateMessage({ content: message, error: true, pending: false, retryText: text })
+      setStatusMessage(message)
     } finally {
+      window.clearTimeout(timeout)
+      if (requestRef.current === controller) requestRef.current = null
       setBusy(false)
+      setChatProgress('')
+      if (completed) composerRef.current?.focus()
     }
+  }
+
+  const handleChatSubmit = () => { void handleSend() }
+
+  const undoLastChange = () => {
+    if (!lastChange || busy) return
+    if (JSON.stringify(workspace) !== lastChange.after) {
+      setStatusMessage('The board has changed since that AI update. Ask the assistant to adjust the specific task instead.')
+      return
+    }
+    setProjects(lastChange.before.projects)
+    setReminders(lastChange.before.reminders)
+    setSelectedProjectId(lastChange.before.selectedProjectId ?? 0)
+    workspaceRef.current = lastChange.before
+    setChatMessages((current) => current.map((message) => message.id === lastChange.messageId
+      ? { ...message, content: 'These changes were undone.', changes: [] } : message))
+    setLastChange(null)
+    setStatusMessage('AI changes undone. Your previous board is restored.')
   }
 
   const navigationMap: Record<SectionKey, { title: string; subtitle: string; description: string }> = {
@@ -700,9 +702,9 @@ function App() {
       <div className="login-shell">
         <div className="login-card">
           <div className="brand-row">
-            <div className="brand-orb">P</div>
+            <div className="brand-orb">J</div>
             <div>
-              <p className="eyebrow">Products Team</p>
+              <p className="eyebrow">Intelligence workspace</p>
               <h1>Welcome</h1>
             </div>
           </div>
@@ -768,9 +770,9 @@ function App() {
     <div className="dashboard-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">P</div>
+          <div className="brand-mark">J</div>
           <div>
-            <p className="eyebrow">Products Team</p>
+            <p className="eyebrow">Intelligence workspace</p>
             <strong>Jetson AI</strong>
           </div>
         </div>
@@ -783,7 +785,7 @@ function App() {
               className={`nav-item ${activeSection === section ? 'active' : ''}`}
               onClick={() => setActiveSection(section)}
             >
-              {section}
+              <span className="nav-symbol" aria-hidden="true">{({ Overview: '◈', 'AI Chat': '✦', Workbench: '▦', Agents: '◎', Storage: '▤' })[section]}</span>{section}
             </button>
           ))}
         </nav>
@@ -805,27 +807,36 @@ function App() {
             <p className="eyebrow">{navigationMap[activeSection].subtitle}</p>
             <h2>{navigationMap[activeSection].title}</h2>
           </div>
-          <span className="status-pill">System online</span>
+          <span className="status-pill">{providers.filter((item) => item.models.length > 0).length} providers available</span>
         </header>
+
+        {dueReminders.length > 0 && <div className="reminder-alert" role="status"><span>◷ {dueReminders.length} reminder{dueReminders.length > 1 ? 's' : ''} due: {dueReminders.slice(0, 2).map((item) => item.title).join(', ')}</span><button type="button" onClick={() => { setActiveSection('Agents'); setActiveAgentTab('Follow-up') }}>Open Reminder Agent ↗</button></div>}
+        {storageWarning && <div className="inline-notice" role="alert">{storageWarning}</div>}
+        {statusMessage && activeSection !== 'AI Chat' && <div className="workspace-notice" role="status">{statusMessage}</div>}
 
         {activeSection === 'Overview' && (
           <div className="content-grid">
+            <section className="workspace-hero">
+              <div><p className="eyebrow">YOUR WORK, CONNECTED</p><h1>Make room for your next idea.</h1><p>Plan with your team. Think with AI. Keep everything moving.</p>
+              <div className="hero-actions"><button className="send-button" onClick={() => setActiveSection('AI Chat')}>Start a conversation ↗</button><button className="secondary-button" onClick={() => setActiveSection('Workbench')}>Open project board</button></div></div>
+              <div className="hero-art" aria-hidden="true">✦</div>
+            </section>
             <section className="stats-grid">
               <div className="stat-card">
                 <span>Open tasks</span>
-                <strong>{projects.reduce((sum, project) => sum + project.tasks.length, 0)}</strong>
+                <strong>{projects.reduce((sum, project) => sum + project.tasks.filter((task) => task.status !== 'Done').length, 0)}</strong>
               </div>
               <div className="stat-card">
                 <span>Enabled agents</span>
                 <strong>{Object.values(enabledAgents).filter(Boolean).length}</strong>
               </div>
               <div className="stat-card">
-                <span>Storage items</span>
-                <strong>{storageItems.length}</strong>
+                <span>Scheduled reminders</span>
+                <strong>{pendingReminders.length}</strong>
               </div>
               <div className="stat-card">
                 <span>Priority alerts</span>
-                <strong>{reminderItems.length || 2}</strong>
+                <strong>{dueReminders.length}</strong>
               </div>
             </section>
 
@@ -883,19 +894,25 @@ function App() {
         {activeSection === 'AI Chat' && (
           <div className="chat-tab-shell panel">
             <div className="chat-toolbar">
+              <button className="secondary-button" disabled={busy} onClick={() => { setChatMessages([]); setStatusMessage('New conversation started. Your projects are unchanged.') }}>＋ New chat</button>
               <label>
                 Provider
-                <select value={selectedProvider} onChange={(event) => setSelectedProvider(event.target.value)}>
+                <select disabled={busy || modelsLoading} value={selectedProvider} onChange={(event) => {
+                  const provider = providers.find((item) => item.provider === event.target.value)
+                  setSelectedProvider(event.target.value)
+                  setSelectedModel(provider?.defaultModel || provider?.models[0] || '')
+                }}>
+                  {providers.length === 0 && <option value="">{modelsLoading ? 'Finding models…' : 'No providers available'}</option>}
                   {providers.map((provider) => (
-                    <option key={provider.provider} value={provider.provider}>
-                      {provider.label}
+                    <option key={provider.provider} value={provider.provider} disabled={!provider.models.length}>
+                      {provider.label}{!provider.models.length ? ' (unavailable)' : ''}
                     </option>
                   ))}
                 </select>
               </label>
               <label>
                 Model
-                <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>
+                <select disabled={busy || modelsLoading} value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>
                   {providers
                     .find((provider) => provider.provider === selectedProvider)
                     ?.models.map((model) => (
@@ -905,38 +922,52 @@ function App() {
                     )) ?? <option value={selectedModel}>{selectedModel}</option>}
                 </select>
               </label>
+              <button type="button" className="secondary-button" disabled={busy || modelsLoading} onClick={() => void loadModels(true)}>{modelsLoading ? 'Finding models…' : '↻ Refresh models'}</button>
             </div>
+            <div className="chat-context"><span>Working in <strong>{activeProject?.name ?? 'No project selected'}</strong></span><button type="button" onClick={() => setActiveSection('Workbench')}>View board ↗</button></div>
+            {!modelsLoading && !providers.some((provider) => provider.models.length > 0) && <div className="inline-notice" role="status">No AI models are available. Check your provider connection or start Ollama, then refresh models.</div>}
 
-            <div className="chat-message-list large-list">
+            <div className="chat-message-list large-list" onScroll={(event) => { const node = event.currentTarget; followConversationRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100 }} aria-busy={busy} role="log" aria-label="Conversation" aria-live="polite">
+              {chatMessages.length === 0 && <div className="chat-welcome"><div className="welcome-spark">✦</div><p className="eyebrow">A LITTLE HELP, A BIG NEXT STEP</p><h2>What are we working on?</h2><p>Explore an idea, untangle a problem, or move your project forward.</p><div className="prompt-grid">{['Create a Website project with design, development and testing tasks', 'Add a task to review the launch copy, assign it to Asha for Friday', 'Remind me to review the launch tomorrow at 10 AM'].map((prompt) => <button key={prompt} onClick={() => setInput(prompt)}>{prompt}<span>↗</span></button>)}</div></div>}
+
               {chatMessages.map((message) => (
                 <div
                   key={message.id}
-                  className={message.role === 'user' ? 'chat-bubble user' : 'chat-bubble assistant'}
+                  className={`${message.role === 'user' ? 'chat-bubble user' : 'chat-bubble assistant'}${message.error ? ' chat-error' : ''}`}
+                  aria-busy={message.pending}
                 >
-                  {message.content}
+                  <small className="message-author">{message.role === 'user' ? 'You' : 'Jetson assistant'}</small>{message.content || (message.pending ? 'Understanding your request…' : '')}
+                  {message.pending && message.content && <small className="message-pending">Checking changes before applying…</small>}
+                  {!!message.changes?.length && <div className="change-receipts"><strong>✓ Changes applied</strong><ul>{message.changes.map((change, index) => <li key={index}>{change}</li>)}</ul><div className="receipt-actions"><button type="button" onClick={() => setActiveSection('Workbench')}>View updated board ↗</button>{lastChange?.messageId === message.id && <button type="button" disabled={busy || JSON.stringify(workspace) !== lastChange.after} onClick={undoLastChange}>Undo these changes</button>}</div></div>}
+                  {message.error && <button type="button" className="retry-button" disabled={busy || !selectedModel} onClick={() => void handleSend(message.retryText)}>Try again ↻</button>}
+                  {message.durationMs !== undefined && <small className="message-timing">{(message.durationMs / 1000).toFixed(1)}s</small>}
                 </div>
               ))}
+              {busy && <div className="thinking-indicator" role="status">✦ {chatProgress}<span>{elapsedSeconds}s</span>{elapsedSeconds >= 10 && <small>The model is taking a little longer. You can stop and choose another model.</small>}</div>}
+              <div ref={chatEndRef} />
             </div>
 
             <div className="composer-box">
               <textarea
+                ref={composerRef}
+                aria-label="Message your project assistant"
+                maxLength={16000}
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter' && !event.shiftKey) {
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                     event.preventDefault()
                     handleChatSubmit()
                   }
                 }}
-                placeholder="Ask the model to create a task, project, or update the backlog..."
+                placeholder="Tell me what to create or change. For example: add a testing task for Asha by Friday…"
                 rows={1}
               />
-              <button type="button" className="send-button" onClick={handleChatSubmit} disabled={busy}>
-                {busy ? '…' : 'Send'}
-              </button>
+              {busy ? <button type="button" className="stop-button" onClick={() => requestRef.current?.abort()}>■ Stop</button> : <button type="button" className="send-button" onClick={handleChatSubmit} disabled={!input.trim() || !selectedModel || modelsLoading}>Send ↑</button>}
             </div>
 
-            {statusMessage && <div className="chat-status">{statusMessage}</div>}
+            <div className="composer-hint">Enter to send · Shift + Enter for a new line · Project changes happen automatically and can be undone</div>
+            {statusMessage && <div className="chat-status" role="status">{statusMessage}</div>}
           </div>
         )}
 
@@ -947,6 +978,7 @@ function App() {
                 <div className="board-title-wrap">
                   <span className="board-icon">◌</span>
                   <h3>Planner Board</h3>
+                  <button type="button" className="secondary-button" onClick={() => { setActiveSection('AI Chat'); setInput(`Help me update ${activeProject?.name ?? 'my project'}`) }}>✦ Ask AI to make changes</button>
                 </div>
               </div>
 
@@ -957,6 +989,8 @@ function App() {
                     value={newProjectName}
                     onChange={(event) => setNewProjectName(event.target.value)}
                     placeholder="Project name"
+                    aria-label="Project name"
+                    maxLength={200}
                   />
                   <button type="button" className="secondary-button" onClick={handleCreateProject}>
                     Create project
@@ -969,8 +1003,8 @@ function App() {
                   <div key={project.id} className="project-tab-wrap">
                     <button
                       type="button"
-                      className={`project-tab ${selectedProjectId === project.id ? 'active' : ''}`}
-                      onClick={() => setSelectedProjectId(project.id)}
+                      className={`project-tab ${activeProject?.id === project.id ? 'active' : ''}`}
+                      onClick={() => { setSelectedProjectId(project.id); setTaskOwner(''); setTaskSearch('') }}
                     >
                       {project.name}
                     </button>
@@ -988,9 +1022,14 @@ function App() {
                 ))}
               </div>
 
+              <div className="board-filters"><input aria-label="Search tasks" placeholder="Search tasks…" value={taskSearch} onChange={(event) => setTaskSearch(event.target.value)} /><select aria-label="Filter by owner" value={taskOwner} onChange={(event) => setTaskOwner(event.target.value)}><option value="">All owners</option>{[...new Set((activeProject?.tasks ?? []).map((task) => task.assignee))].map((owner) => <option key={owner}>{owner}</option>)}</select><span>{activeProject?.tasks.length ?? 0} tasks · {storageWarning ? 'Session only' : 'Saved on this device'}</span><button type="button" className="secondary-button" onClick={() => {
+                const url = URL.createObjectURL(new Blob([JSON.stringify(workspace, null, 2)], { type: 'application/json' }))
+                const link = document.createElement('a'); link.href = url; link.download = 'jetson-projects.json'; link.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+              }}>Export projects ↓</button></div>
+              {!activeProject && <div className="inline-notice">Create your first project above, or ask the AI to create one with tasks.</div>}
               <div className="board-columns">
                 {boardColumns.map((column) => {
-                  const columnTasks = (activeProject?.tasks ?? []).filter((task) => task.status === column.key)
+                  const columnTasks = (activeProject?.tasks ?? []).filter((task) => task.status === column.key && (!taskOwner || task.assignee === taskOwner) && `${task.title} ${task.notes} ${task.assignee}`.toLowerCase().includes(taskSearch.toLowerCase()))
                   return (
                     <div
                       key={column.key}
@@ -1029,9 +1068,11 @@ function App() {
                                 <span className="task-status-tag">{task.assignee}</span>
                               </div>
                               <h4>{task.title}</h4>
+                              {task.notes && <p className="task-notes">{task.notes}</p>}
+                              <select className="task-status-select" aria-label={`Status for ${task.title}`} value={task.status} onChange={(event) => handleTaskMove(task.id, event.target.value as TaskStatus)}>{statuses.map((status) => <option key={status}>{status}</option>)}</select>
                               <div className="task-labels">
                                 <span className="label-pill">{task.assignee}</span>
-                                <span className="label-pill">{task.timeline}</span>
+                                <span className="label-pill">{formatTimeline(task.timeline)}</span>
                               </div>
                               <div className="task-footers">
                                 <span>Created by {task.createdBy}</span>
@@ -1052,23 +1093,32 @@ function App() {
                     value={taskDraft.title}
                     onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))}
                     placeholder="Task name"
+                    aria-label="Task name"
+                    maxLength={300}
                   />
                   <input
                     value={taskDraft.assignee}
                     onChange={(event) => setTaskDraft((current) => ({ ...current, assignee: event.target.value }))}
-                    placeholder="Allocate to"
+                    placeholder="Owner (optional)"
+                    aria-label="Task owner"
+                    maxLength={100}
                   />
                   <input
+                    type="date"
                     value={taskDraft.timeline}
                     onChange={(event) => setTaskDraft((current) => ({ ...current, timeline: event.target.value }))}
                     placeholder="Timeline"
+                    aria-label="Task deadline"
+                    maxLength={100}
                   />
                   <textarea
                     value={taskDraft.notes}
                     onChange={(event) => setTaskDraft((current) => ({ ...current, notes: event.target.value }))}
                     placeholder="Notes"
+                    aria-label="Task notes"
+                    maxLength={4000}
                   />
-                  <button type="button" className="send-button task-button" onClick={handleAddTask}>
+                  <button type="button" className="send-button task-button" disabled={!activeProject || !taskDraft.title.trim()} onClick={handleAddTask}>
                     Add task
                   </button>
                 </div>
@@ -1100,7 +1150,7 @@ function App() {
                       <span className="agent-badge">Documentation Agent</span>
                     </div>
                     <h3>Product documentation assistant</h3>
-                    <p>Generate summaries, release notes, and project docs from natural-language prompts.</p>
+                    <p>Generate summaries, release notes, and HTML presentation outlines from prompts and text sources.</p>
                     <div className="skill-stack">
                       {Object.entries(documentationSkills).map(([skill, enabled]) => (
                         <button
@@ -1125,15 +1175,17 @@ function App() {
                       </label>
                     </div>
                     <label className="upload-button compact-upload">
-                      Upload file or image
+                      Upload text sources
                       <input
                         type="file"
-                        accept="image/*,.pdf,.doc,.docx,.txt,.md,.ppt,.pptx"
+                        accept=".txt,.md,.csv,.json"
                         multiple
                         onChange={(event) => {
                           const files = Array.from(event.target.files ?? [])
                           if (!files.length) return
-                          setAttachedFiles((current) => [...current, ...files])
+                          const accepted = files.filter((file) => file.size <= 1024 * 1024 && /\.(txt|md|csv|json)$/i.test(file.name))
+                          if (accepted.length !== files.length) setStatusMessage('Use text files up to 1 MB each. PDF, Office and image extraction is not supported yet.')
+                          setAttachedFiles((current) => [...current, ...accepted].slice(0, 5))
                           event.target.value = ''
                         }}
                       />
@@ -1171,7 +1223,7 @@ function App() {
                             placeholder="Picture a launch note, feature summary, or deck outline..."
                             rows={3}
                           />
-                          <button type="button" className="send-button" onClick={handleDocumentationSubmit}>
+                          <button type="button" className="send-button" disabled={busy} onClick={() => void handleDocumentationSubmit()}>
                             Save doc
                           </button>
                         </div>
@@ -1196,7 +1248,7 @@ function App() {
                       <span className="agent-badge">Reminder Agent</span>
                     </div>
                     <h3>Follow-up automation</h3>
-                    <p>Tracks deadlines, owner reminders, and team signals that need attention.</p>
+                    <p>Monitors reminders delegated from AI Chat, checks due times every 15 seconds, and shows alerts while the workspace is open.</p>
                     <button
                       type="button"
                       className="secondary-button"
@@ -1206,7 +1258,12 @@ function App() {
                     </button>
                   </div>
                   <div className="agent-card reminder-card">
-                    <h3>Current reminders</h3>
+                    <div className="history-header"><h3>Reminder Agent monitor</h3><span>{enabledAgents.reminders ? '● Monitoring' : 'Paused'} · {pendingReminders.length} scheduled</span></div>
+                    <p className="section-description">Reminders stay on this device. Monitoring resumes when you reopen the app; notifications are not sent while it is closed.</p>
+                    <div className="reminder-create"><input aria-label="Reminder title" placeholder="What should I remind you about?" maxLength={300} value={reminderDraft.title} onChange={(event) => setReminderDraft((current) => ({ ...current, title: event.target.value }))} /><input type="datetime-local" aria-label="Reminder date and time" value={reminderDraft.dueAt} onChange={(event) => setReminderDraft((current) => ({ ...current, dueAt: event.target.value }))} /><button type="button" className="send-button" disabled={!reminderDraft.title.trim() || !reminderDraft.dueAt} onClick={createReminder}>Schedule reminder</button></div>
+                    {notificationPermission !== 'unsupported' && notificationPermission !== 'granted' && <button type="button" className="secondary-button" onClick={async () => { const permission = await Notification.requestPermission(); setNotificationPermission(permission); setStatusMessage(permission === 'granted' ? 'Desktop alerts enabled while this app is open.' : 'Desktop alerts are blocked. Due reminders will still appear inside the app.') }}>Enable desktop alerts</button>}
+                    <div className="scheduled-reminders">{reminders.length === 0 ? <p>No reminders yet. Ask AI Chat: “Remind me to check the launch tomorrow at 10 AM.”</p> : reminders.map((item) => <article key={item.id} className={`scheduled-reminder ${item.status === 'done' ? 'complete' : Date.parse(item.dueAt) <= nowMs ? 'due' : ''}`}><div><strong>{item.title}</strong><time dateTime={item.dueAt}>{new Date(item.dueAt).toLocaleString()}</time><small>{item.status === 'done' ? 'Completed' : Date.parse(item.dueAt) <= nowMs ? 'Due now' : 'Scheduled'}{item.notes && ` · ${item.notes}`}</small></div>{item.status === 'pending' && <button type="button" className="secondary-button" onClick={() => completeReminder(item.id)}>Mark done</button>}</article>)}</div>
+                    <h3>Task follow-ups</h3>
                     {enabledAgents.reminders && reminderItems.length > 0 ? (
                       <ul>
                         {reminderItems.map((item) => (
@@ -1347,7 +1404,14 @@ function App() {
                             if (entry.type !== 'folder') return
                             event.preventDefault()
                             const draggedId = Number(event.dataTransfer.getData('text/storage-entry'))
-                            if (Number.isNaN(draggedId) || draggedId === entry.id) return
+                            if (!draggedId || Number.isNaN(draggedId) || draggedId === entry.id) return
+                            let parent: StorageEntry | undefined = entry
+                            const visited = new Set<number>()
+                            while (parent && !visited.has(parent.id)) {
+                              if (parent.id === draggedId) { setStatusMessage('A folder cannot be moved inside itself.'); return }
+                              visited.add(parent.id)
+                              parent = parent.parentId === null ? undefined : storageFolderLookup[parent.parentId]
+                            }
                             setStorageItems((current) =>
                               current.map((item) =>
                                 item.id === draggedId ? { ...item, parentId: entry.id, lastUpdated: 'Moved now' } : item,
